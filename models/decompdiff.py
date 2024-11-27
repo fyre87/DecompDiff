@@ -408,6 +408,15 @@ class DecompScorePosNet3D(nn.Module):
         loss_pos = scatter_mean(mask * decoder_nll_pos + (1. - mask) * kl_pos, batch, dim=0)
         return loss_pos
 
+    # New function
+    def compute_pos_Lt_nll(self, pos_model_mean, x0, xt, t, batch):
+        # fixed pos variance
+        pos_log_variance = extract(self.posterior_logvar, t, batch)
+        pos_true_mean = self.q_pos_posterior(x0=x0, xt=xt, t=t, batch=batch)
+        decoder_nll_pos = -log_normal(x0, means=pos_model_mean, log_scales=0.5 * pos_log_variance)
+        loss_pos = scatter_mean(decoder_nll_pos, batch, dim=0)
+        return loss_pos
+
     def compute_v_Lt(self, log_v_model_prob, log_v0, log_v_true_prob, t, batch):
         kl_v = categorical_kl(log_v_true_prob, log_v_model_prob)  # [num_atoms, ]
         decoder_nll_v = -log_categorical(log_v0, log_v_model_prob)  # L0
@@ -415,6 +424,12 @@ class DecompScorePosNet3D(nn.Module):
         mask = (t == 0).float()[batch]
         loss_v = scatter_mean(mask * decoder_nll_v + (1. - mask) * kl_v, batch, dim=0)
         return loss_v
+
+    # New function
+    def compute_v_Lt_nll(self, log_v_model_prob, log_v0, batch):
+        decoder_nll_v = -log_categorical(log_v0, log_v_model_prob)  # L0
+        decoder_nll_v = scatter_mean(decoder_nll_v, batch, dim=0)
+        return decoder_nll_v
 
     def get_diffusion_loss(
             self, protein_pos, protein_v, batch_protein, protein_group_idx,
@@ -486,6 +501,7 @@ class DecompScorePosNet3D(nn.Module):
 
         pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
         pred_pos_noise = pred_ligand_pos - ligand_pos_perturbed
+
         # atom position
         if self.model_mean_type == 'noise':
             pos0_from_e = self._predict_x0_from_eps(
@@ -548,6 +564,117 @@ class DecompScorePosNet3D(nn.Module):
             results['losses']['bond'] = loss_bond
             results['ligand_b_recon'] = F.softmax(preds['pred_bond'], dim=-1)
         return results
+
+    ### New code:::
+    def get_dpo_loss(
+            self, protein_pos, protein_v, batch_protein, protein_group_idx,
+            ligand_pos, ligand_v, ligand_v_aux, batch_ligand, ligand_group_idx,
+            prior_centers, prior_stds, prior_num_atoms, batch_prior, prior_group_idx,
+
+            ligand_decomp_batch, ligand_decomp_index,
+            ligand_fc_bond_index=None, ligand_fc_bond_type=None, batch_ligand_bond=None, ligand_atom_mask=None,
+            time_step=None
+    ):
+        num_graphs = batch_protein.max().item() + 1
+        # 1. sample noise levels
+        if time_step is None:
+            time_step, pt = self.sample_time(num_graphs, protein_pos.device, self.sample_time_method)
+        else:
+            pt = torch.ones_like(time_step).float() / self.num_timesteps
+        a = self.alphas_cumprod.index_select(0, time_step)  # (num_graphs, )
+
+        # 2. perturb pos, v, (and bond)
+        assert len(ligand_decomp_batch) == prior_num_atoms.sum().item()
+        batch_noise_centers = prior_centers[ligand_decomp_batch]
+        batch_noise_stds = prior_stds[ligand_decomp_batch]
+        assert len(batch_noise_centers) == len(batch_ligand)
+        assert len(batch_noise_stds) == len(batch_ligand)
+        a_pos = a[batch_ligand].unsqueeze(-1)  # (num_ligand_atoms, 1)
+        pos_noise = torch.zeros_like(ligand_pos)
+        pos_noise.normal_()
+        # Xt = a.sqrt() * X0 + (1-a).sqrt() * eps
+        ligand_pos_perturbed = a_pos.sqrt() * (ligand_pos - batch_noise_centers) + \
+                               (1.0 - a_pos).sqrt() * pos_noise * batch_noise_stds + batch_noise_centers
+        # Vt = a * V0 + (1-a) / K
+        log_ligand_v0 = index_to_log_onehot(ligand_v, self.num_classes)
+        ligand_v_perturbed, log_ligand_vt = self.atom_type_trans.q_v_sample(log_ligand_v0, time_step, batch_ligand)
+
+        if self.bond_diffusion:
+            log_ligand_b0 = index_to_log_onehot(ligand_fc_bond_type, self.num_bond_classes)
+            ligand_b_perturbed, log_ligand_bt = self.bond_type_trans.q_v_sample(
+                log_ligand_b0, time_step, batch_ligand_bond)
+        else:
+            ligand_b_perturbed = None
+
+        protein_pos, ligand_pos_perturbed, offset = center_pos(
+            protein_pos, ligand_pos_perturbed, batch_protein, batch_ligand, mode=self.center_pos_mode)
+        ligand_pos = ligand_pos - offset[batch_ligand]
+        prior_centers = prior_centers - offset[batch_prior]
+        # 3. forward-pass NN, feed perturbed pos and v, output noise
+        preds = self.forward(
+            protein_pos=protein_pos,
+            protein_v=protein_v,
+            batch_protein=batch_protein,
+            protein_group_idx=protein_group_idx,
+
+            init_ligand_pos=ligand_pos_perturbed,
+            init_ligand_v=ligand_v_perturbed,
+            init_ligand_v_aux=ligand_v_aux,
+            batch_ligand=batch_ligand,
+            ligand_group_idx=ligand_group_idx,
+            ligand_fc_bond_index=ligand_fc_bond_index,
+            init_ligand_fc_bond_type=ligand_b_perturbed,
+
+            prior_centers=prior_centers,
+            prior_stds=prior_stds,
+            batch_prior=batch_prior,
+            prior_group_idx=prior_group_idx,
+
+            time_step=time_step,
+            ligand_atom_mask=ligand_atom_mask
+        )
+
+        pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
+        pred_pos_noise = pred_ligand_pos - ligand_pos_perturbed
+
+        # atom position
+        if self.model_mean_type == 'noise':
+            pos0_from_e = self._predict_x0_from_eps(
+                xt=ligand_pos_perturbed, eps=pred_pos_noise, t=time_step, batch=batch_ligand)
+            pos_model_mean = self.q_pos_posterior(
+                x0=pos0_from_e, xt=ligand_pos_perturbed, t=time_step, batch=batch_ligand)
+        elif self.model_mean_type == 'C0':
+            pos_model_mean = self.q_pos_posterior(
+                x0=pred_ligand_pos, xt=ligand_pos_perturbed, t=time_step, batch=batch_ligand)
+        else:
+            raise ValueError
+        # atom type
+        log_ligand_v_recon = F.log_softmax(pred_ligand_v, dim=-1)
+        log_v_model_prob = self.atom_type_trans.q_v_posterior(log_ligand_v_recon, log_ligand_vt, time_step, batch_ligand)
+        log_v_true_prob = self.atom_type_trans.q_v_posterior(log_ligand_v0, log_ligand_vt, time_step, batch_ligand)
+
+        # compute kl
+        pos_nll = self.compute_pos_Lt_nll(pos_model_mean=pos_model_mean, x0=ligand_pos,
+                                     xt=ligand_pos_perturbed, t=time_step, batch=batch_ligand)
+        v_nll = self.compute_v_Lt_nll(log_v_model_prob=log_v_model_prob, log_v0=log_ligand_v0,
+                                 batch=batch_ligand)
+        if self.bond_diffusion:
+            log_ligand_b_recon = F.log_softmax(preds['pred_bond'], dim=-1)
+            log_b_model_prob = self.bond_type_trans.q_v_posterior(
+                log_ligand_b_recon, log_ligand_bt, time_step, batch_ligand_bond)
+            # log_b_true_prob = self.bond_type_trans.q_v_posterior(
+            #     log_ligand_b0, log_ligand_bt, time_step, batch_ligand_bond)
+            b_nll = self.compute_v_Lt_nll(log_v_model_prob=log_b_model_prob, log_v0=log_ligand_b0,
+                                     batch=batch_ligand_bond)
+        else:
+            loss_bond = torch.tensor(0.)
+
+        # I guess just assume they are independent because I think they kinda are???
+        # Note that log(xy) = log(x) + log(y)
+        nll = pos_nll + v_nll + b_nll
+
+        return nll
+
 
     @torch.no_grad()
     def sample_diffusion(self, protein_pos, protein_v, batch_protein, protein_group_idx,
